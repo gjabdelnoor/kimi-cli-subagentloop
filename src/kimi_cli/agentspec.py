@@ -41,6 +41,14 @@ class AgentSpec(BaseModel):
     )
     model: str | None = Field(default=None, description="Default model alias")
     when_to_use: str | None = Field(default=None, description="Usage guidance")
+    max_timeout_s: int | None = Field(
+        default=None,
+        description=(
+            "Per-type override for the Agent-tool timeout cap, in seconds. "
+            "None means use the global cap."
+        ),
+        ge=30,
+    )
     tools: list[str] | None | Inherit = Field(default=inherit, description="Tools")  # required
     allowed_tools: list[str] | None | Inherit = Field(default=inherit, description="Allowed tools")
     exclude_tools: list[str] | None | Inherit = Field(
@@ -67,6 +75,7 @@ class ResolvedAgentSpec:
     system_prompt_args: dict[str, str]
     model: str | None
     when_to_use: str
+    max_timeout_s: int | None
     tools: list[str]
     allowed_tools: list[str] | None
     exclude_tools: list[str]
@@ -101,6 +110,7 @@ def load_agent_spec(agent_file: Path) -> ResolvedAgentSpec:
         system_prompt_args=agent_spec.system_prompt_args,
         model=agent_spec.model,
         when_to_use=agent_spec.when_to_use or "",
+        max_timeout_s=agent_spec.max_timeout_s,
         tools=agent_spec.tools or [],
         allowed_tools=agent_spec.allowed_tools,
         exclude_tools=agent_spec.exclude_tools or [],
@@ -148,6 +158,8 @@ def _load_agent_spec(agent_file: Path) -> AgentSpec:
             base_agent_spec.model = agent_spec.model
         if agent_spec.when_to_use is not None:
             base_agent_spec.when_to_use = agent_spec.when_to_use
+        if agent_spec.max_timeout_s is not None:
+            base_agent_spec.max_timeout_s = agent_spec.max_timeout_s
         if not isinstance(agent_spec.tools, Inherit):
             base_agent_spec.tools = agent_spec.tools
         if not isinstance(agent_spec.allowed_tools, Inherit):

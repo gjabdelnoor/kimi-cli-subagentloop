@@ -31,6 +31,11 @@ class AgentTypeDefinition:
     default_model: str | None = None
     tool_policy: ToolPolicy = field(default_factory=lambda: ToolPolicy(mode="inherit"))
     supports_background: bool = True
+    max_timeout_s: int | None = None
+    """Per-type override for the Agent-tool ``timeout`` cap.
+    ``None`` means the global ``MAX_FOREGROUND_TIMEOUT`` / ``MAX_BACKGROUND_TIMEOUT``
+    applies. Set higher only when the type's work fundamentally needs more time
+    (e.g. ``reviewer`` reading a large deliverable cold)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -1022,6 +1022,21 @@ def acp():
     acp_main()
 
 
+@cli.command(name="__review-loop-gate", hidden=True)
+def review_loop_gate() -> None:
+    """Stop-hook entry for the adversarial review loop (internal).
+
+    Reads the Stop hook JSON payload from stdin and decides whether to
+    re-drive the main agent. See ``kimi review-loop --help`` for the
+    user-facing surface.
+    """
+    import sys
+
+    from kimi_cli.review_loop import gate_main
+
+    sys.exit(gate_main())
+
+
 @cli.command(name="__background-task-worker", hidden=True)
 def background_task_worker(
     task_dir: Annotated[Path, typer.Option("--task-dir")],

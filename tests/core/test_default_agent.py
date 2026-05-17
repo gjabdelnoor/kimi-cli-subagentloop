@@ -243,6 +243,23 @@ At any time, you should be HELPFUL, CONCISE, and ACCURATE. Be thorough in your a
                     "kimi_cli.tools.web:FetchURL",
                 ),
             ),
+            (
+                "reviewer",
+                (
+                    "Adversarial peer reviewer. Invoked automatically by the "
+                    "review-loop Stop hook after the main agent finishes its TODO list."
+                ),
+                "reviewer.yaml",
+                None,
+                "allowlist",
+                (
+                    "kimi_cli.tools.shell:Shell",
+                    "kimi_cli.tools.file:ReadFile",
+                    "kimi_cli.tools.file:ReadMediaFile",
+                    "kimi_cli.tools.file:Glob",
+                    "kimi_cli.tools.file:Grep",
+                ),
+            ),
         ]
     )
 
@@ -292,6 +309,7 @@ instance can preserve previous findings and work.
 - `coder`: Good at general software engineering tasks. (Tools: Shell, ReadFile, ReadMediaFile, Glob, Grep, WriteFile, StrReplaceFile, SearchWeb, FetchURL, Model: inherit, Background: yes). When to use: Use this agent for non-trivial software engineering work that may require reading files, editing code, running commands, and returning a compact but technically complete summary to the parent agent.
 - `explore`: Fast codebase exploration with prompt-enforced read-only behavior. (Tools: Shell, ReadFile, ReadMediaFile, Glob, Grep, SearchWeb, FetchURL, Model: inherit, Background: yes). When to use: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (e.g. "src/**/*.yaml"), search code for keywords (e.g. "database connection"), or answer questions about the codebase (e.g. "how does the auth module work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "thorough" for comprehensive analysis across multiple locations and naming conventions. Use this agent for any read-only exploration that will clearly require more than 3 tool calls. Prefer launching multiple explore agents concurrently when investigating independent questions.
 - `plan`: Read-only implementation planning and architecture design. (Tools: ReadFile, ReadMediaFile, Glob, Grep, SearchWeb, FetchURL, Model: inherit, Background: yes). When to use: Use this agent when the parent agent needs a step-by-step implementation plan, key file identification, and architectural trade-off analysis before code changes are made.
+- `reviewer`: Adversarial peer reviewer. Invoked automatically by the review-loop Stop hook after the main agent finishes its TODO list. (Tools: Shell, ReadFile, ReadMediaFile, Glob, Grep, Model: inherit, Background: yes). When to use: Invoked automatically by the review-loop Stop hook after the main agent finishes its TODO list. Reads the deliverable cold and returns a structured Accept / Revise / Restart verdict. Do not call directly from end-user prompts; the review-loop hook drives it.
 
 **Usage**
 
@@ -359,11 +377,11 @@ When calling explore, specify the desired thoroughness in the prompt:
                 },
                 "timeout": {
                     "anyOf": [
-                        {"maximum": 3600, "minimum": 30, "type": "integer"},
+                        {"maximum": 86400, "minimum": 30, "type": "integer"},
                         {"type": "null"},
                     ],
                     "default": None,
-                    "description": "Timeout in seconds for the agent task. Foreground: no default timeout (runs until completion), max 3600s (1hr). Background: default from config (15min), max 3600s (1hr). The agent is stopped if it exceeds this limit.",
+                    "description": "Timeout in seconds for the agent task. Foreground: no default timeout (runs until completion), default cap 3600s (1hr). Background: default from config (15min), default cap 3600s (1hr). Some built-in types (e.g. `reviewer`) may raise their own cap. The agent is stopped if it exceeds this limit.",
                 },
             },
             "required": ["description", "prompt"],

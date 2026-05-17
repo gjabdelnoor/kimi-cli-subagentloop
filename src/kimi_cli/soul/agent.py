@@ -428,6 +428,7 @@ async def load_agent(
                 when_to_use=builtin_spec.when_to_use,
                 default_model=builtin_spec.model,
                 tool_policy=tool_policy,
+                max_timeout_s=builtin_spec.max_timeout_s,
             )
         )
 

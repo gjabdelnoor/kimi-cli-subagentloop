@@ -57,6 +57,11 @@ def test_load_default_agent_spec():
                 "Fast codebase exploration with prompt-enforced read-only behavior.",
             ),
             "plan": ("plan.yaml", "Read-only implementation planning and architecture design."),
+            "reviewer": (
+                "reviewer.yaml",
+                "Adversarial peer reviewer. Invoked automatically by the review-loop "
+                "Stop hook after the main agent finishes its TODO list.",
+            ),
         }
     )
 

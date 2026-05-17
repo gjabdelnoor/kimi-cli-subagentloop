@@ -55,11 +55,11 @@ def test_agent_params_schema(agent_tool: AgentTool):
                 },
                 "timeout": {
                     "anyOf": [
-                        {"maximum": 3600, "minimum": 30, "type": "integer"},
+                        {"maximum": 86400, "minimum": 30, "type": "integer"},
                         {"type": "null"},
                     ],
                     "default": None,
-                    "description": "Timeout in seconds for the agent task. Foreground: no default timeout (runs until completion), max 3600s (1hr). Background: default from config (15min), max 3600s (1hr). The agent is stopped if it exceeds this limit.",
+                    "description": "Timeout in seconds for the agent task. Foreground: no default timeout (runs until completion), default cap 3600s (1hr). Background: default from config (15min), default cap 3600s (1hr). Some built-in types (e.g. `reviewer`) may raise their own cap. The agent is stopped if it exceeds this limit.",
                 },
             },
             "required": ["description", "prompt"],
