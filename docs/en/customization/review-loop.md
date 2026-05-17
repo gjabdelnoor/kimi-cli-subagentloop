@@ -1,70 +1,82 @@
 # Adversarial Review Loop (Design)
 
-Status: design only. No code changes yet — this document describes how a
-self-iterating "produce → review → re-plan" loop would be wired onto Kimi
-Code CLI's existing subagent, hook, and TODO primitives.
+Status: design only. No code changes yet.
 
-## Goal
-
-When the main agent finishes a TODO list, automatically spawn a fresh
-reviewer subagent with no investment in the work, feed its critical /
-major / minor / taste-oriented findings back to the main agent, and have
+Goal: when the main agent finishes a TODO list, automatically spawn a
+fresh reviewer subagent with no investment in the work, feed its
+Critical / Major / Minor / Taste flags back to the main agent, and have
 the main agent compose the next iteration's TODO list. Repeat until the
-reviewer accepts or an iteration ceiling is hit. Every iteration is
-captured in git so any version can be reproduced or reverted.
+reviewer accepts or an iteration ceiling is hit.
 
-The reviewer's role prompt is the
-[Stage 4 protocol](#stage-4-reviewer-system-prompt) below: read
-checkpoints before narrative, cross-reference every claim, flag the
-canonical agent failure modes, output a structured Accept / Revise /
-Restart verdict.
+KISS: the loop owns no version control, no branches, no snapshots, no
+state beyond a tiny iteration counter. Git is the user's concern. The
+loop's job is **validity, QC, and maintainability of the iteration
+itself.**
 
-## Architecture at a glance
+## Why this shape
+
+Kimi already has every primitive needed:
+
+- **Subagent isolation** — `ForegroundSubagentRunner`
+  (`src/kimi_cli/subagents/runner.py:204-355`) gives a fresh `Context`,
+  fresh LLM clone, and `role != "root"`. The reviewer literally cannot
+  see the main agent's reasoning. That structural independence is the
+  whole point of the role.
+- **Stop hook re-drive** — when a `Stop` hook returns `block` + `reason`,
+  the soul injects that reason as the next user message and runs another
+  turn (`src/kimi_cli/soul/kimisoul.py:654-671`). This is the one
+  mechanism that lets a hook nudge the main agent back into action
+  without forking a process or polling.
+- **TODO state on disk** — `SetTodoList` persists to `session.state.todos`
+  (`src/kimi_cli/tools/todo/__init__.py:100-117`). The hook can read it
+  to decide whether the iteration is finished.
+
+So the design is: one new subagent type, one Stop hook, one timeout
+override, one ~50-line state file. Nothing else.
+
+## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │             main agent (root)               │
-                    │  - owns TODO list (SetTodoList)             │
-                    │  - calls Agent(subagent_type="reviewer")    │
-                    └────────────┬────────────────────────────────┘
-                                 │ Stop event (turn ends)
-                                 ▼
-                ┌────────────────────────────────────┐
-                │  Stop hook: review_loop_gate.py    │
-                │  - all todos == done?              │
-                │  - git commit deliverable to       │
-                │    review-loop/<session>/vX.Y      │
-                │  - build reviewer prompt           │
-                │  - emit hookSpecificOutput "deny"  │
-                │    with instruction:               │
-                │    "Run Agent(reviewer, resume=…)" │
-                └────────────┬───────────────────────┘
-                             │ block → reason injected as next user turn
-                             ▼
-        ┌────────────────────────────────────────────────────┐
-        │ main agent runs Agent tool                         │
-        │  → ForegroundSubagentRunner.run                    │
-        │  → reviewer subagent (fresh / resumed) reads       │
-        │    checkpoints, then deliverable, then writes      │
-        │    structured review                               │
-        │  → returns final assistant message to main agent   │
-        └────────────┬───────────────────────────────────────┘
-                     │
-                     ▼
-        Main agent translates flags into V(N+1) TODO list
-        via SetTodoList. Loop continues at the next Stop.
+main agent finishes a turn
+        │
+        ▼
+   Stop hook fires
+        │
+        ├─ todos not all "done"  ──► exit 0, nothing happens
+        ├─ stop_hook_active=true ──► exit 0, never recurse
+        ├─ iteration ceiling hit ──► exit 0, surface to user
+        │
+        └─ todos all "done"
+                │
+                ▼
+          build reviewer prompt
+                │
+                ▼
+          emit hookSpecificOutput.permissionDecision="deny"
+          with reason = "Run Agent(reviewer, …) then translate
+                         the verdict into the next TODO list"
+                │
+                ▼ (soul injects reason as next user turn)
+        main agent runs Agent(subagent_type="reviewer", timeout=9999, …)
+                │
+                ▼
+          reviewer reads deliverable cold, returns structured verdict
+                │
+                ▼
+        main agent writes verdict to .kimi/review-loop/v<n>-review.md,
+        then either:
+           - "Accept"      → marks loop done, ends turn → hook exits 0
+           - other verdict → calls SetTodoList with new items → ends turn
+                │
+                ▼
+          Stop hook fires again on the new turn ─── (repeat)
 ```
-
-The only mechanism that re-drives the main soul automatically is the
-`Stop` hook's `block` + `reason` path
-(`src/kimi_cli/soul/kimisoul.py:654-671`). Everything else in this design
-piggy-backs on that.
 
 ## Components
 
-### 1. Reviewer subagent definition
+### 1. Reviewer subagent
 
-New file `src/kimi_cli/agents/default/reviewer.yaml`:
+`src/kimi_cli/agents/default/reviewer.yaml`:
 
 ```yaml
 version: 1
@@ -77,13 +89,13 @@ agent:
     a structured Accept / Revise / Restart verdict. Do not call directly
     from end-user prompts — use the loop.
   allowed_tools:
-    - "kimi_cli.tools.shell:Shell"        # read-only intent (git log/diff, ls, cat)
+    - "kimi_cli.tools.shell:Shell"        # read-only intent
     - "kimi_cli.tools.file:ReadFile"
     - "kimi_cli.tools.file:ReadMediaFile"
     - "kimi_cli.tools.file:Glob"
     - "kimi_cli.tools.file:Grep"
   exclude_tools:
-    - "kimi_cli.tools.agent:Agent"        # already filtered by role != root
+    - "kimi_cli.tools.agent:Agent"
     - "kimi_cli.tools.file:WriteFile"
     - "kimi_cli.tools.file:StrReplaceFile"
     - "kimi_cli.tools.todo:SetTodoList"
@@ -91,42 +103,33 @@ agent:
     - "kimi_cli.tools.plan.enter:EnterPlanMode"
 ```
 
-Register it in `src/kimi_cli/agents/default/agent.yaml` under
-`subagents:`:
+Register in `src/kimi_cli/agents/default/agent.yaml` under `subagents:`:
 
 ```yaml
   reviewer:
     path: ./reviewer.yaml
-    description: "Adversarial peer reviewer for autonomous deliverables. Invoked by the review loop."
+    description: "Adversarial peer reviewer. Invoked by the review loop."
 ```
 
-Once registered, `LaborMarket.add_builtin_type` is called for it during
-`load_agent()` (`src/kimi_cli/soul/agent.py:413-432`) like any other
-built-in type. No runner changes are required to launch it — the
-existing `Agent` tool path is sufficient.
+Read-only is non-negotiable: the reviewer must not be able to silently
+fix what it flags. That's the bias the role exists to counter.
 
-### 2. Timeout cap
+### 2. Timeout override
 
-The current `Agent` tool hard-codes `MAX_FOREGROUND_TIMEOUT = 3600`
-(`src/kimi_cli/tools/agent/__init__.py:17-18`) and Pydantic enforces it
-via `le=MAX_BACKGROUND_TIMEOUT` on the `timeout` field. To honour the
-9999 s reviewer timeout, add a per-type override on
+`MAX_FOREGROUND_TIMEOUT = 3600` in `tools/agent/__init__.py:17` caps the
+9999 s the reviewer needs. Add one optional field to
 `AgentTypeDefinition` (`src/kimi_cli/subagents/models.py`):
 
 ```python
-max_timeout_s: int | None = None      # None → use global cap
+max_timeout_s: int | None = None      # None → global cap applies
 ```
 
-In `tools/agent/__init__.py`, after `type_def` lookup, replace the
-constant cap with `type_def.max_timeout_s or MAX_FOREGROUND_TIMEOUT`
-when validating `params.timeout`. The `reviewer` YAML then sets
-`max_timeout_s: 9999`. Other subagents are unaffected — keeps the
-1 h default global ceiling intact.
+Use it in `tools/agent/__init__.py` when validating `params.timeout`.
+`reviewer.yaml` sets `max_timeout_s: 9999`. Other types unaffected.
 
-### 3. Stop hook gate
+### 3. Stop-hook gate
 
-A small Python script invoked as a shell hook. Suggested path:
-`scripts/review_loop_gate.py`. Configured in `~/.kimi/config.toml`:
+`scripts/review_loop_gate.py`, registered in `~/.kimi/config.toml`:
 
 ```toml
 [[hooks]]
@@ -135,241 +138,247 @@ command = "python3 /abs/path/scripts/review_loop_gate.py"
 timeout = 30
 ```
 
-The hook contract is the existing one (`src/kimi_cli/hooks/runner.py`):
-read JSON from stdin; to re-drive the agent, exit 0 with stdout JSON
-shaped like
+Hook contract (already in place per `src/kimi_cli/hooks/runner.py`):
+read JSON on stdin, exit 0 and print
 
 ```json
 {
   "hookSpecificOutput": {
     "permissionDecision": "deny",
-    "permissionDecisionReason": "<instruction text injected as next user turn>"
+    "permissionDecisionReason": "<instruction injected as next user turn>"
   }
 }
 ```
 
-Exit 2 (block via stderr) also works but the JSON form is preferred —
-it survives future hook-result schema evolution.
+to re-drive the main agent. Exit 0 with no output for "do nothing."
 
-#### Behaviour
+**Hook logic, in order:**
 
-1. Parse stdin → `{ session_id, cwd, stop_hook_active, ... }`. If
-   `stop_hook_active` is true, **exit 0 with no output** (we are already
-   inside a hook-re-driven turn; never recurse).
-2. Load `session.state.todos` via the on-disk session state file (path
-   discoverable from `session_id`; see `session_state.py`). If `todos`
-   is empty or any item is not `done`, exit 0.
-3. Read/write `${cwd}/.kimi/review-loop/state.json`:
-   ```json
-   {
-     "session_id": "...",
-     "iteration": "0.1",          // bumped after each reviewer run
-     "reviewer_agent_id": null,    // populated after first run
-     "branch": "review-loop/<short-session>",
-     "history": [
-       { "version": "0.1", "commit": "abc1234", "verdict": null, "reviewer_agent_id": null }
-     ]
-   }
-   ```
-4. Snapshot the deliverable to git (see [Git layout](#git-layout)).
-5. Build the reviewer prompt (see [Prompt template](#reviewer-prompt-template)).
-   Write it to `.kimi/review-loop/v<version>/reviewer-prompt.md` so the
-   instruction can pass a file path instead of a giant inline string.
-6. Compose the `permissionDecisionReason` instruction (see
-   [Instruction to main agent](#instruction-to-main-agent)) and print
-   the JSON envelope on stdout, then exit 0.
-7. After the main agent runs the reviewer and emits the next `Stop`,
-   the hook re-fires: it sees the state file already recorded a
-   reviewer for `v0.1`, reads the reviewer's output file written by
-   the main agent (see step 8), updates `history`, bumps `iteration`
-   to `0.2`, and — if the verdict was anything other than `Accept` —
-   repeats from step 4. If the verdict was `Accept` or the iteration
-   ceiling (default `0.5`) is reached, exit 0 with no block.
+1. Read stdin → `{session_id, cwd, stop_hook_active}`.
+2. If `stop_hook_active` → exit 0. (Defensive; never recurse.)
+3. Load `${cwd}/.kimi/review-loop/state.json` (create with defaults if
+   absent — see schema below).
+4. If `state.done` → exit 0. The loop has already accepted.
+5. If `state.iteration >= state.max_iterations` → emit a block whose
+   reason is *"Iteration ceiling reached. Summarise current state and
+   the latest reviewer verdict to the user; ask whether to continue
+   manually."* Mark `state.done = true`. Exit 0.
+6. Read `session.state.todos` (via the on-disk session state file —
+   path derived from `session_id`). If empty or any item not `done`,
+   exit 0.
+7. **Decide whether a reviewer is owed.** If `state.last_reviewed_iteration
+   < state.iteration`, the main agent just finished an iteration and
+   owes a review. Build the reviewer prompt (see below), write it to
+   `.kimi/review-loop/v{n}-prompt.md`, and emit a block with the
+   "run reviewer" instruction.
+8. Otherwise (`last_reviewed_iteration == state.iteration`), the main
+   agent just finished acting on the previous review. Bump
+   `state.iteration += 1`, exit 0 — the *next* Stop will be the one
+   that triggers the next review.
 
-The "main agent writes reviewer output to a known path" handshake is
-how the hook reads the reviewer's verdict without parsing the soul's
-internal context. It is part of the instruction in step 6.
+That bump in step 8 is the only thing keeping the hook from triggering
+two reviews back-to-back. Everything else flows from the todo list and
+the existence of a reviewer output file.
 
-### 4. Instruction to main agent
+### 4. State file
 
-The hook injects the following as the next user-turn message
-(simplified; real text would be a single string):
+`.kimi/review-loop/state.json` — small enough to read in one glance:
 
-> The TODO list for **V<version>** is complete. The deliverable has
-> been committed to `<branch>@<sha>`. A reviewer subagent must now
-> audit it.
+```json
+{
+  "session_id": "...",
+  "iteration": 1,
+  "max_iterations": 5,
+  "last_reviewed_iteration": 0,
+  "reviewer_agent_id": null,
+  "done": false
+}
+```
+
+That is the entire loop state. No history list, no commit shas, no
+branch names. If you want history, the per-iteration files
+(`v{n}-prompt.md`, `v{n}-review.md`) on disk are the history.
+
+`reviewer_agent_id` is populated by the main agent the first time it
+calls `Agent(subagent_type="reviewer", …)` and is passed back on V2+
+as `resume=` so the reviewer's own `Context` accumulates prior reviews
+without the prompt having to re-include them.
+
+### 5. Instruction to the main agent
+
+The hook's `permissionDecisionReason` for a normal review step:
+
+> The TODO list for **iteration {n}** is complete. A reviewer subagent
+> must now audit it.
 >
 > 1. Run:
 >    ```
 >    Agent(
 >      subagent_type="reviewer",
 >      timeout=9999,
->      resume=<reviewer_agent_id or null>,
->      description="Review V<version>",
->      prompt=<contents of .kimi/review-loop/v<version>/reviewer-prompt.md>
+>      resume=<reviewer_agent_id or omit>,
+>      description="Review iteration {n}",
+>      prompt=<file contents of .kimi/review-loop/v{n}-prompt.md>
 >    )
 >    ```
->    Pass `resume=` only if the state file already records a
->    reviewer agent id from a prior iteration. The reviewer will read
->    that prompt to recover full context for V0.2+.
-> 2. Write the reviewer's full response to
->    `.kimi/review-loop/v<version>/reviewer-output.md`.
-> 3. If the verdict is **Accept**, mark the loop done by appending a
->    `done: true` marker to `.kimi/review-loop/state.json` and stop.
-> 4. Otherwise, translate the reviewer's Critical / Major / Minor /
->    Taste flags into a new TODO list via `SetTodoList`, then proceed
->    to work them. Each flag becomes one or more `pending` items, in
->    Critical → Major → Minor → Taste order.
+>    Pass `resume=` only if `.kimi/review-loop/state.json` already has
+>    `reviewer_agent_id` set. After the call, update `state.json` with
+>    the agent id returned in the tool output.
+> 2. Write the reviewer's full response verbatim to
+>    `.kimi/review-loop/v{n}-review.md`.
+> 3. If the verdict line begins with "Accept", set `state.done = true`
+>    in `state.json` and stop. Otherwise call `SetTodoList` with the new
+>    items, **quoting each reviewer flag verbatim in the title** of its
+>    corresponding TODO item (one flag may produce multiple items, in
+>    Critical → Major → Minor → Taste order).
+> 4. End the turn. Do not continue working until the next hook fires.
 
-The hook re-fires after step 3 or 4 because the soul emits another
-`Stop`. The hook reads `reviewer-output.md`, records the verdict, and
-either re-loops or exits silently.
+The verbatim-quoting rule is the cheap, mechanical QC check: it makes
+drift between reviewer flags and TODO items detectable on the next
+iteration, because the next reviewer prompt includes both the previous
+review and the previous TODO list.
 
-### 5. Reviewer prompt template
+### 6. Reviewer prompt template
 
-Layout of `reviewer-prompt.md`:
+For iteration 1 (`v1-prompt.md`):
 
 ```
-<adversarial reviewer role prompt — Stage 4 text>
+<Stage-4 adversarial reviewer role prompt, verbatim>
 
-<HR>
+---
 
-## Conversation history (V0.1 originating context)
-<all user messages + AI text responses up through the V0.1 plan,
-extracted from the root Context file at session_state.path>
+## Originating conversation
+<all user messages + main-agent text responses from session start
+through the first SetTodoList call>
 
-## TODO history
-### V0.1
+## TODO list executed for iteration 1
 - [done] item 1
 - [done] item 2
 ...
-### V0.2     (only present on V0.2+)
-...
 
 ## Deliverable
-- branch: review-loop/<short-session>
-- commit: <sha for this version>
-- diff vs previous version (or vs base for V0.1):
-  <inline `git diff <prev_sha>..<sha>`>
-- changed files:
-  <inline `git diff --stat`>
-
-## Previous review                  (V0.2+ only)
-<contents of .kimi/review-loop/v<prev>/reviewer-output.md>
+<list of files the agent created or modified during iteration 1,
+each followed by its current contents — capped at, say, 500 lines per
+file with a "[…N more lines]" pointer for longer files>
 
 ## Your task
-Execute the review protocol on V<version>. Read checkpoints before
-narrative. Output the structured review format.
+Execute the review protocol on iteration 1. Output the structured
+review format. Verdict line must begin with one of:
+  "Accept minor revisions" | "Major revisions" |
+  "Fundamental rethink"    | "Destroy and restart"
 ```
 
-On `resume=`, the reviewer subagent's restored `Context`
-(`subagents/core.py:60-70`) already holds all prior reviewer turns; the
-prompt only needs to add the *new* deliverable diff and new TODO list,
-not the full Stage 4 role prompt again. The hook can therefore emit a
-shorter prompt for V0.2+ — just the "## Deliverable", "## TODO history
-(new entries)", and "## Your task" sections.
-
-### 6. Git layout
-
-A dedicated branch per session, off whatever HEAD the user started on:
+For iteration N>1 with `resume=`, the prompt is short because the
+reviewer's `Context` already holds the role prompt and prior reviews:
 
 ```
-<user-branch>
-  └─ review-loop/<short-session-id>
-       ├─ V0.1   (commit sha …a1)
-       ├─ V0.2   (commit sha …a2)
-       └─ V0.3   (commit sha …a3)
+## TODO list executed for iteration {n}
+- [done] item 1
+...
+
+## Deliverable (changes since iteration {n-1})
+<files modified during iteration n, current contents>
+
+## Previous iteration: your verdict
+"<verbatim verdict line from v{n-1}-review.md>"
+
+## Your task
+Re-review. Did the main agent address each flag you raised in iteration
+{n-1}? Any new flags? Verdict line same format as before.
 ```
 
-Commit messages: `review-loop v<version>: <first 60 chars of user
-prompt>`. Tags optional but recommended: `review-loop-<session>-v0.1`
-etc. for `git checkout`-ability.
+Identifying "files modified during iteration N" without git: have the
+main agent's per-iteration instruction also include *"list every file
+you create or edit during this iteration in `.kimi/review-loop/v{n}-files.txt`"*.
+Cheap, explicit, no VCS dependency.
 
-Hook git operations (run in `cwd`):
+### 7. Stage 4 reviewer system prompt
 
-```sh
-# First iteration only
-git checkout -b review-loop/<short-session> <user-branch>
+`src/kimi_cli/agents/default/reviewer.md` is the Stage 4 protocol,
+generalised:
 
-# Every iteration
-git add -A
-git commit -m "review-loop v<version>: ..." --allow-empty
-git tag review-loop-<session>-v<version>
-```
+- "Every numerical claim must trace to a checkpoint" → "Every
+  load-bearing claim in the deliverable must trace to a concrete source
+  (file, log, computed artifact). A claim with no source is a flag; a
+  source that doesn't say what the deliverable claims is a critical
+  flag."
+- Canonical failure modes list stays as-is, domain-agnostic: literature
+  values presented as fits, silent synthetic-data substitution, wrong
+  inputs, parameter-set mismatches, internal contradictions, broken
+  references, generation residue, work that was never actually run.
+- "Synth-data-audit detector" → "If a deterministic integrity check
+  exists for the deliverable's domain, run it. If it fails, stop
+  reviewing — verdict is *Destroy and restart*."
+- Epistemic discipline and output-format sections unchanged.
+- Review-intensity-by-version section unchanged in spirit but rephrased
+  to "by iteration number" since there's no version-tagging.
 
-The user's working branch is never touched. Final acceptance can either
-leave the loop branch in place for the user to merge or open a PR (out
-of scope for V1).
+## What this gives you, and what it doesn't
 
-### 7. Termination
+**Validity**
 
-- Reviewer verdict `Accept minor revisions` with no Critical/Major
-  flags → main agent writes `done: true`, hook exits 0.
-- Reviewer verdict `Destroy and restart` → hook `git reset --hard` the
-  loop branch back to V0.0 (the pre-V0.1 base SHA recorded in state),
-  injects a "restart with these constraints …" instruction instead of
-  the normal V(N+1) flow.
-- Iteration ceiling (`max_iterations`, default `5` → caps at V0.5) →
-  hook exits 0 with a final instruction telling the main agent to
-  surface to the user with the latest reviewer output and ask whether
-  to continue manually.
-- `stop_hook_active == true` always exits 0 immediately — defensive
-  against any path where the soul somehow re-enters the hook inside the
-  same turn.
+- Reviewer context is structurally fresh (`ForegroundSubagentRunner`
+  guarantees it). The reviewer cannot inherit the main agent's bias
+  toward task completion.
+- The reviewer prompt is built from on-disk artifacts (TODO list,
+  enumerated deliverable files, prior review), not from anything the
+  main agent narrated into its own context.
+- Verbatim-quoting rule on TODO items makes flag-vs-action drift
+  visible to the next reviewer.
 
-### 8. Stage 4 reviewer system prompt
+**QC**
 
-`src/kimi_cli/agents/default/reviewer.md` contents are the Stage 4
-protocol verbatim, generalised to "any computational deliverable" rather
-than dry-lab-specific. The canonical agent failure modes list stays
-domain-agnostic (literature values as fits, silent synthetic data
-substitution, wrong-data computations, parameter-set mismatches,
-abstract/methods/results contradictions, broken refs, generation
-residue, unexecuted notebooks). The "synth-data-audit detector" line is
-generalised to "if a deterministic integrity check exists for this
-domain, run it; if it fails, stop reviewing — destroy and restart."
+- One state file. One iteration counter. One ceiling. Failure modes
+  are: (a) hook crashes — fail-open (`hooks/runner.py:53-55` already
+  does this), loop quietly stops; (b) reviewer times out — main agent
+  receives a `ToolError`, ends turn, hook re-fires and either retries
+  or hits ceiling; (c) main agent skips step 2/3 of the instruction —
+  hook detects missing `v{n}-review.md` on the next fire and re-emits
+  the instruction.
+- `stop_hook_active` guard prevents recursion in every path.
+- `done` flag is sticky: once set, the hook exits 0 forever for this
+  session. User can clear it manually to restart.
 
-The epistemic-discipline and output-format sections are unchanged.
+**Maintainability**
 
-## Open considerations
+- All loop state visible in two places: the YAML files (loop shape) and
+  one JSON file per session (loop progress). No database, no git
+  parsing, no diff arithmetic.
+- The hook is a single Python script with no Kimi imports. It only
+  needs: stdin JSON parsing, file I/O, the path to the on-disk session
+  state. If the Kimi internals change, the hook is unaffected as long
+  as the Stop event payload and the session-state TODO schema stay
+  stable.
+- The reviewer subagent is just a YAML + system prompt. No runner
+  changes. No tool changes beyond the timeout override.
 
-- **Subagents cannot call subagents.** `tools/agent/__init__.py:121`
-  enforces `runtime.role != "root"`. This is fine for the reviewer
-  (read-only) but means a future "implementer subagent that also
-  triggers its own reviewer" path won't work without lifting that
-  restriction or providing an explicit nested-runner.
-- **Hook script needs session-state path.** The Stop event payload only
-  carries `session_id` and `cwd`. The script needs the same path
-  derivation that `Session` uses internally; either expose a small
-  helper CLI (`kimi session path <id>`) or document the layout. Cleanest
-  option is the helper CLI — keeps the hook decoupled from the on-disk
-  schema.
-- **Context length.** V0.5 reviewer prompts will accumulate four prior
-  diffs + four prior reviews. Use `resume=` from V0.2 onward so the
-  reviewer's own `Context` holds the prior reviews and the hook only
-  appends the *new* deliverable. Diffs can be capped to N lines with a
-  pointer to the full file in the loop branch.
-- **Reviewer output drift.** The main agent could paraphrase the
-  reviewer's flags when building the V(N+1) TODO list. Two mitigations:
-  (a) require the main agent to verbatim-quote each flag in the TODO
-  item title, and (b) the next-iteration reviewer prompt includes the
-  previous reviewer's output, so drift is detectable.
-- **TaskStop / cancellation.** If the user cancels mid-review, the
-  reviewer is killed (`subagents/runner.py:311-318`) and the main agent
-  receives a `RunCancelled`. The state file may end up referencing a
-  reviewer commit that has no corresponding `reviewer-output.md` — the
-  hook must treat a missing output file as "no verdict, do not loop"
-  and exit 0.
+**What this explicitly does NOT do**
 
-## Out of scope for V1
+- No git interaction of any kind. Snapshots, rollback, branches: out of
+  scope. If the user wants those, they manage them outside the loop.
+- No automatic "restart from scratch" implementation for the
+  *Destroy and restart* verdict — the hook just surfaces the verdict to
+  the main agent and the user decides. Self-destructing loops are
+  exactly the kind of clever thing that breaks invisibly.
+- No background reviewer runs. Foreground only — the main agent has to
+  wait for the verdict before its next turn, which is the point.
+- No parallel reviewers, no aggregator, no per-domain reviewer
+  routing. One reviewer per loop.
 
-- Background reviewer runs (`run_in_background=true`). Foreground is
-  required because the loop needs the reviewer's text before the main
-  agent's next turn.
-- Multiple parallel reviewers (e.g. domain-specific + code-quality).
-  The architecture extends to it — a second `reviewer-*` subagent type
-  plus an aggregator step in the instruction — but adds prompt-routing
-  complexity that should wait for evidence the single-reviewer loop
-  improves deliverables.
-- Slash command shortcut (`/review-loop`). Easy add later; not needed
-  to validate the loop.
+## Open questions worth pinning before implementation
+
+- **Session-state path discovery.** The Stop event payload carries
+  `session_id` and `cwd`, not the on-disk path of the session state
+  file. Either (a) document the path layout the hook should rely on, or
+  (b) ship a tiny `kimi session path <id>` helper command. (b) is more
+  robust against future layout changes and is ~10 lines of CLI.
+- **"All files modified this iteration" enumeration.** The proposal
+  above asks the main agent to maintain `v{n}-files.txt` itself.
+  Cheaper than git, brittle to the agent forgetting. Acceptable if the
+  reviewer's prompt also includes a directory-tree snapshot so missing
+  files at least show up structurally.
+- **Verdict parsing.** Anchoring on the first line is fragile. Consider
+  requiring the reviewer to end the response with a single-line
+  `VERDICT: <one of the four>` marker. The hook can grep for it.
+  Slightly less elegant than free-form, but a 1-line regex check is
+  much more maintainable than a parser.
