@@ -34,3 +34,6 @@ agent:
     plan:
       path: ./plan.yaml
       description: "Read-only implementation planning and architecture design."
+    reviewer:
+      path: ./reviewer.yaml
+      description: "Adversarial peer reviewer. Invoked automatically by the review-loop Stop hook after the main agent finishes its TODO list."

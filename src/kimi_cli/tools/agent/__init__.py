@@ -16,6 +16,9 @@ NAME = "Agent"
 
 MAX_FOREGROUND_TIMEOUT = 60 * 60  # 1 hour
 MAX_BACKGROUND_TIMEOUT = 60 * 60  # 1 hour
+# Absolute ceiling enforced by the Params schema. Individual types may set a
+# lower or higher (up to this) cap via AgentTypeDefinition.max_timeout_s.
+MAX_TIMEOUT_HARD_CAP = 24 * 60 * 60  # 24 hours
 
 
 class Params(BaseModel):
@@ -48,12 +51,13 @@ class Params(BaseModel):
         default=None,
         description=(
             "Timeout in seconds for the agent task. "
-            "Foreground: no default timeout (runs until completion), max 3600s (1hr). "
-            "Background: default from config (15min), max 3600s (1hr). "
+            "Foreground: no default timeout (runs until completion), default cap 3600s (1hr). "
+            "Background: default from config (15min), default cap 3600s (1hr). "
+            "Some built-in types (e.g. `reviewer`) may raise their own cap. "
             "The agent is stopped if it exceeds this limit."
         ),
         ge=30,
-        le=MAX_BACKGROUND_TIMEOUT,
+        le=MAX_TIMEOUT_HARD_CAP,
     )
 
     @property
@@ -99,6 +103,36 @@ class AgentTool(CallableTool2[Params]):
     def _normalize_summary(text: str) -> str:
         return " ".join(text.split())
 
+    def _enforce_type_timeout_cap(self, params: Params, *, foreground: bool) -> ToolError | None:
+        """Apply the per-type ``max_timeout_s`` override.
+
+        If the requested timeout exceeds the type's cap, returns a ToolError.
+        Pydantic has already enforced the absolute hard cap.
+        """
+        if params.timeout is None:
+            return None
+        if params.resume:
+            try:
+                record = self._runtime.subagent_store.require_instance(params.resume)  # type: ignore[union-attr]
+                actual_type = record.subagent_type
+            except Exception:
+                actual_type = params.subagent_type or "coder"
+        else:
+            actual_type = params.subagent_type or "coder"
+        type_def = self._runtime.labor_market.get_builtin_type(actual_type)
+        global_cap = MAX_FOREGROUND_TIMEOUT if foreground else MAX_BACKGROUND_TIMEOUT
+        type_cap = type_def.max_timeout_s if type_def is not None else None
+        effective_cap = type_cap if type_cap is not None else global_cap
+        if params.timeout > effective_cap:
+            return ToolError(
+                message=(
+                    f"Requested timeout {params.timeout}s exceeds the cap for subagent type "
+                    f"'{actual_type}' ({effective_cap}s)."
+                ),
+                brief="Timeout exceeds type cap",
+            )
+        return None
+
     @staticmethod
     def _tool_summary(type_def: AgentTypeDefinition) -> str:
         if type_def.tool_policy.mode != "allowlist":
@@ -128,6 +162,9 @@ class AgentTool(CallableTool2[Params]):
                 message=f"Unknown model alias: {params.model}",
                 brief="Invalid model alias",
             )
+        cap_error = self._enforce_type_timeout_cap(params, foreground=not params.run_in_background)
+        if cap_error is not None:
+            return cap_error
         if params.run_in_background:
             return await self._run_in_background(params)
         timeout = params.effective_timeout

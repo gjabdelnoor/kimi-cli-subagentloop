@@ -136,6 +136,7 @@ export default withMermaid(defineConfig({
                 { text: 'Hooks (Beta)', link: '/en/customization/hooks' },
                 { text: 'Agent Skills', link: '/en/customization/skills' },
                 { text: 'Agents and Subagents', link: '/en/customization/agents' },
+                { text: 'Adversarial Review Loop', link: '/en/customization/review-loop' },
                 { text: 'Print Mode', link: '/en/customization/print-mode' },
                 { text: 'Wire Mode', link: '/en/customization/wire-mode' },
               ],
